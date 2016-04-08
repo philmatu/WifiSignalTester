@@ -1,0 +1,341 @@
+/*
+  See readme for details.
+  Author: Philip Matuskiewicz - philip.matuskiewicz@nyct.com
+
+  #using NodeMCU Amica with ESP8266 chipset
+*/
+
+#include <ESP8266WiFi.h>
+
+#define ID              "4" // hard coded id for this transmitter
+#define WLAN_SSID       ""
+#define WLAN_PASS       ""
+#define HOST            ""
+#define IP              "5.5.5.5"// ip of remote.server.com
+#define WEBPAGE         "/wifi"
+#define DOWNLOAD_SIZE   524288 // 512kb in characters
+#define TIMEOUT         15
+#define LOG_INTERVAL    120 // 2 minutes
+
+IPAddress LOCAL_PING_TARGET(192,168,0,1);//local router ip
+IPAddress REMOTE_PING_TARGET(5,5,5,5);//ip of remote.server.com
+
+#define READ_SIZE       512 // how many characters to read at a time
+char DOWNLOADED_DATA[READ_SIZE+1];
+
+// PING FUNCTIONALITY
+#include "os_type.h"
+extern "C" {
+#include "ping.h"
+}
+
+//light function
+int lightcount = 0;
+int lightmax = 5;//10 minutes at 2 minutes per checkin
+
+ping_option pingOps; // Struct used by ping_start, see ping.h
+IPAddress PING_TARGET;
+int P_TIMES = 4;//how many pings to do
+//generic holder for main function callback
+int P_LOSS = -1;
+int P_RCV = 0;
+long P_AVG = 0L;
+//local holder for last local data
+int PL_LOSS = -1;
+int PL_RCV = 0;
+long PL_AVG = 0L;
+//remote holder for last remote data
+int PR_LOSS = -1;
+int PR_RCV = 0;
+long PR_AVG = 0L;
+
+// This function is called when a ping is received or the request times out:
+static void ICACHE_FLASH_ATTR ping_recv (void* arg, void *pdata)
+{
+  struct ping_resp *pingrsp = (struct ping_resp *)pdata;
+
+  if (pingrsp->bytes > 0L)
+  {
+    /*
+    Serial.print("PING reply from: ");
+    Serial.print(PING_TARGET);
+    Serial.print(": ");
+    Serial.print("bytes=");
+    Serial.print(pingrsp->bytes);
+    Serial.print(" time=");
+    Serial.print(pingrsp->resp_time);
+    */
+    P_AVG = P_AVG + pingrsp->resp_time;//add to the average counter
+    //Serial.println("ms");
+  }
+  /*
+  else
+  {
+    Serial.println("Request timed out");
+  }
+  */
+}
+
+// This function is called after the ping request is completed
+static void ICACHE_FLASH_ATTR ping_sent (void* arg, void *pdata)
+{
+  struct ping_resp *pingrsp = (struct ping_resp *)pdata;
+  /*
+  Serial.print("Ping statistics for: ");
+  Serial.println(PING_TARGET);
+  Serial.print("Packets: Sent = ");
+  Serial.print(pingrsp->total_count);
+  Serial.print(", Recieved = ");
+  */
+  int rcv = pingrsp->total_count-pingrsp->timeout_count;
+  /*
+  Serial.print(rcv);
+  Serial.print(", Lost = ");
+  */
+  int los = pingrsp->timeout_count;
+  /*
+  Serial.print(los);
+  Serial.print(" (");
+  Serial.print(float(pingrsp->timeout_count)/pingrsp->total_count*100);
+  Serial.println("% loss)");
+  */
+
+  //do calculations to release lock on ping
+  P_AVG = P_AVG / rcv;
+  P_LOSS = los;
+  P_RCV = rcv;
+}
+
+boolean ping_send()
+{
+  P_AVG = 0L;// reset ping
+  P_LOSS = -1;// reset loss
+  P_RCV = 0;
+  
+  pingOps.count = P_TIMES;
+  pingOps.ip = uint32_t(PING_TARGET);
+  pingOps.coarse_time = 3; // how long before the ping times out (seconds)
+  ping_regist_sent(&pingOps, ping_sent); 
+  ping_regist_recv(&pingOps, ping_recv);
+
+  Serial.print("Pinging: ");
+  Serial.print(PING_TARGET);
+  Serial.println(" with 32 bytes of data");
+  ping_start(&pingOps); // send the ping
+  delay(1000);
+
+  int ct = 0; // catch all way to make sure this never hangs but waits for the ping to complete before moving onto the rest of the app.
+  while( ((P_LOSS + P_RCV) < P_TIMES) && ct < 56L){//14 second max lag (56 tries at .25 seconds each = 14 seconds), worst case, ping times out after 12 seconds, add latency
+    delay(250L);//make programming thread wait for pinger to end  
+    ct = ct + 1L;
+  }
+
+  if(ct > 55L){
+    return false;  
+  }
+
+  return true;
+  
+}
+
+void ping_print(int loss, int rcv, long avg)
+{  
+        Serial.print("Packets lost: ");
+        Serial.print(loss);
+        Serial.print(", Packets received: ");
+        Serial.print(rcv);
+        Serial.print(", Average Latency (time): ");
+        Serial.print(avg);
+        Serial.println("ms");
+}
+
+// END PING FUNCTIONALITY
+
+void setup(void)
+{
+  Serial.begin(115200);
+  pinMode(D0, OUTPUT);
+  digitalWrite(D0, LOW);//turn light on
+}
+
+void localPrint(int32_t rssi, IPAddress local_ip, boolean local_ping_success, boolean remote_ping_success, long elapse) 
+{
+  Serial.println("IP address: ");
+  Serial.println(local_ip);
+  Serial.print("Network RSSI ");
+  Serial.println(rssi);
+  Serial.print("Local Uptime ");
+  Serial.println(millis());
+  if(local_ping_success){
+    Serial.print("Local --- ");
+    ping_print(PL_LOSS, PL_RCV, PL_AVG);
+  }
+  if(remote_ping_success){
+    Serial.print("Remote --- ");
+    ping_print(PR_LOSS, PR_RCV, PR_AVG);
+  }
+  Serial.print("Time to download ");
+  Serial.print(DOWNLOAD_SIZE);
+  Serial.print(" characters was ");
+  Serial.print(elapse);
+  Serial.println("ms.");
+}
+
+boolean post(int32_t rssi, IPAddress local_ip, boolean local_ping_success, boolean remote_ping_success, long elapse) {
+
+  String url = WEBPAGE;
+  url += "?id=";
+  url += ID;
+  url += "&rssi=";
+  url += rssi;
+  url += "&localip=";
+  url += local_ip;
+  url += "&localtime=";
+  url += millis();
+  url += "&download_size_bytes=";
+  url += DOWNLOAD_SIZE;
+  url += "&download_time_ms=";
+  url += elapse;
+  if(local_ping_success){
+    url += "&local_ping_lost_packet_count=";
+    url += PL_LOSS;
+    url += "&local_ping_received_packet_count=";
+    url += PL_RCV;
+    url += "&local_ping_avg_latency_ms=";
+    url += PL_AVG;
+  }
+  if(remote_ping_success){
+    url += "&remote_ping_lost_packet_count=";
+    url += PR_LOSS;
+    url += "&remote_ping_received_packet_count=";
+    url += PR_RCV;
+    url += "&remote_ping_avg_latency_ms=";
+    url += PR_AVG;
+  }
+
+  WiFiClient client;
+  client.setTimeout(TIMEOUT * 1000L);
+  if (!client.connect(IP, 80)) {
+    Serial.println("HTTP connection failed");
+    return false;
+  }
+  client.print(String("GET ") + url + " HTTP/1.1\r\n" +
+               "Host: " + HOST + "\r\n" +
+               "Connection: close\r\n\r\n");
+  delay(10L);
+
+  Serial.println(url);
+  delay(1000L);
+
+  while (client.available()) {
+    String line = client.readStringUntil('\r');
+    if (line.startsWith("HTTP")) {
+      Serial.println(line);
+      Serial.println("ending client.");//just check to make sure we got a code back!
+      client.stop();
+      return true;
+    }
+  }
+
+  Serial.println("Client failed to retrieve data, closing.");
+  return false;
+}
+
+long fileDownloadTest()
+{  
+  String url = WEBPAGE;
+  url += "?file=";
+  url += DOWNLOAD_SIZE;
+
+  Serial.print("Timing download for ");
+  Serial.print(DOWNLOAD_SIZE);
+  Serial.println(" characters (bytes).");
+
+  WiFiClient client;
+  client.setTimeout(TIMEOUT * 1000L);
+  if (!client.connect(IP, 80)) {
+    Serial.println("HTTP connection failed");
+    return false;
+  }
+  client.print(String("GET ") + url + " HTTP/1.1\r\n" +
+               "Host: " + HOST + "\r\n" +
+               "Connection: close\r\n\r\n");
+  delay(1000L);
+
+  long rd = 0L;
+  long start = 0L;
+  while (client.available() && rd < DOWNLOAD_SIZE-1) {//timeout will kill client if this hangs
+    if(start > 0L){
+        int c = client.readBytes(DOWNLOADED_DATA, READ_SIZE);
+        rd = rd + c;
+    }else{
+      //otherwise read headers
+      String line = client.readStringUntil('\n');
+      if(line.equals("\r")){
+        start = millis();
+      }
+    }
+  }
+  long fin = millis();
+  long elapse = fin - start;
+
+  Serial.print("READ ");
+  Serial.print(rd);
+  Serial.print(" characters (bytes) in ");
+  Serial.print(elapse);
+  Serial.println("ms");
+
+  return elapse;
+}
+
+void loop() {
+  if(lightcount > lightmax){
+    digitalWrite(D0, HIGH);
+  }
+  lightcount = lightcount + 1;
+  Serial.println("Connecting...");
+  WiFi.begin(WLAN_SSID, WLAN_PASS);
+  int i = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000L);
+    Serial.print(".");
+    i++;
+    if (i > TIMEOUT) {
+      WiFi.disconnect();
+      Serial.println("TIMED OUT CONNECTING TO WIFI!  Waiting until the next scheduled logging event.");
+      delay(LOG_INTERVAL * 1000L);
+      return;
+    }
+  }
+  Serial.println("WiFi Connected!");
+
+  PING_TARGET = LOCAL_PING_TARGET;
+  boolean local_ping_success = ping_send();
+  if(local_ping_success){
+    PL_LOSS = P_LOSS;
+    PL_RCV = P_RCV;
+    PL_AVG = P_AVG;
+  }
+
+  PING_TARGET = REMOTE_PING_TARGET;
+  boolean remote_ping_success = ping_send();
+  if(remote_ping_success){
+    PR_LOSS = P_LOSS;
+    PR_RCV = P_RCV;
+    PR_AVG = P_AVG;
+  }
+  
+  int32_t rssi = WiFi.RSSI();
+  IPAddress local_ip = WiFi.localIP();
+
+  long elapse = fileDownloadTest();
+
+  localPrint(rssi, local_ip, local_ping_success, remote_ping_success, elapse);
+  post(rssi, local_ip, local_ping_success, remote_ping_success, elapse);
+
+  Serial.println("WiFi Disconnected!  Waiting until the next scheduled logging event.");
+  WiFi.disconnect();
+
+  delay(LOG_INTERVAL * 1000L);
+}
+
